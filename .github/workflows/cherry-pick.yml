@@ -1,0 +1,161 @@
+name: Cherry-Pick Backport
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Upstream repository (owner/repo)"
+        required: false
+        default: "istio/istio"
+        type: string
+      target_branches:
+        description: "Comma-separated target branches"
+        required: true
+        type: string
+      source_shas:
+        description: "Comma-separated commit SHAs"
+        required: true
+        type: string
+      extra_context:
+        description: "Additional context for the agent (e.g. known issues, skip certain tests)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      pairs: ${{ steps.gen.outputs.pairs }}
+    steps:
+      - id: gen
+        run: |
+          pairs='[]'
+          IFS=',' read -ra BRANCHES <<< "${{ inputs.target_branches }}"
+          IFS=',' read -ra SHAS <<< "${{ inputs.source_shas }}"
+          for sha in "${SHAS[@]}"; do
+            sha=$(echo "$sha" | xargs)
+            for branch in "${BRANCHES[@]}"; do
+              branch=$(echo "$branch" | xargs)
+              pairs=$(echo "$pairs" | jq -c --arg s "$sha" --arg b "$branch" '. + [{"sha": $s, "branch": $b}]')
+            done
+          done
+          echo "pairs=$pairs" >> "$GITHUB_OUTPUT"
+
+  cherry-pick:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pair: ${{ fromJson(needs.generate-matrix.outputs.pairs) }}
+      fail-fast: false
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.pair.branch }}
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "merge-bot"
+          git config user.email "merge-bot@ossm.redhat.com"
+
+      - name: Fetch upstream commit
+        run: |
+          git remote add upstream "https://github.com/${{ inputs.upstream_repo }}.git"
+          git fetch upstream "${{ matrix.pair.sha }}"
+
+      - name: Generate backport hints
+        run: |
+          git show "${{ github.sha }}:.github/scripts/generate-backport-hints.sh" > /tmp/generate-backport-hints.sh
+          chmod +x /tmp/generate-backport-hints.sh
+          /tmp/generate-backport-hints.sh "${{ matrix.pair.sha }}" "${{ matrix.pair.branch }}"
+
+      - name: Cherry-pick
+        id: pick
+        run: |
+          SHA="${{ matrix.pair.sha }}"
+          BRANCH="${{ matrix.pair.branch }}"
+          SHORT="${SHA:0:8}"
+          PICK_BRANCH="cherry-pick-${SHORT}-into-${BRANCH}"
+
+          if git rev-parse --verify "refs/remotes/origin/$PICK_BRANCH" &>/dev/null; then
+            echo "::error::Branch '$PICK_BRANCH' already exists on origin"
+            exit 1
+          fi
+          git checkout -b "$PICK_BRANCH"
+          git cherry-pick "$SHA" || true
+
+          echo "pick_branch=$PICK_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_ENV"
+
+      - name: Install Cursor CLI
+        run: curl https://cursor.com/install -fsS | bash
+
+      - name: Run Cursor agent
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          cat > /tmp/prompt.txt <<'PROMPT'
+          You are an expert Release Engineer tasked with backporting upstream commit ${{ matrix.pair.sha }} into the `${{ matrix.pair.branch }}` branch of `${{ github.repository }}`.
+
+          A `git cherry-pick` has been attempted. Your job is to complete the backport, ensure the code is fully adapted to the older branch, verify it passes tests, and finalize the commit.
+
+          Before starting, read `/tmp/backport-hints`. It contains known divergences between this branch and upstream. Use these facts to guide your adaptation — do not waste time rediscovering them.
+
+          Follow these phases:
+
+          ### Phase 1: Merge Conflict Resolution
+          If the cherry-pick failed with conflicts:
+          1. Locate all files with conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`).
+          2. Resolve the conflicts logically, ensuring the intent of the upstream commit is preserved within the context of the older branch's architecture.
+          3. Remove all conflict markers.
+          4. Run `git add` on the resolved files and execute `git cherry-pick --continue`.
+
+          ### Phase 1.5: Downstream-Only Files
+          If the cherry-pick touched `istio.deps`, revert those changes immediately: `git checkout HEAD -- istio.deps`. This file is maintained separately in the downstream and must never be overwritten by upstream commits.
+
+          ### Phase 2: Code & Context Adaptation
+          Even if there are no conflicts, or after conflicts are resolved, you MUST audit the changed files for branch-specific mismatches. Adapt the code as needed:
+          * **API & Import Paths:** Internal APIs or file structures may differ. Update imports and function calls to match the older branch.
+          * **Language & Syntax:** Ensure the backported code does not use language features or standard library additions that are unsupported by the older branch's runtime version.
+          * **Dependencies:** If the upstream commit relies on newer third-party packages, adapt the code to work with the older dependencies present in this branch. Do not bump dependency versions unless absolutely necessary for the fix to function.
+          * **Test Fixtures & Golden Files:** Update any hardcoded version strings or expected outputs that reference the upstream branch.
+
+          ### Phase 3: Verification
+          1. Identify which test suites cover the modified code.
+          2. Run these tests. 
+          3. If tests fail, analyze the failure, fix the backported code, and re-run until successful. 
+          4. If you determine the backport requires a massive architectural rewrite that makes it fundamentally incompatible, halt and output a summary of why it cannot be safely backported.
+
+          ### Phase 4: Finalization
+          If you made *any* changes to the code beyond a clean cherry-pick (including conflict resolution, API adaptation, or syntax downgrades), you must amend the commit message to document your changes.
+          1. Run `git commit --amend` (do not use `--no-edit`).
+          2. Retain the original commit message, author intent, and the standard `(cherry picked from commit ...)` annotation.
+          3. Append git trailers at the very bottom of the message (after a blank line following the last line of body text). Use this exact format:
+
+          Backport-Change: <one-line summary of what you modified or dropped>
+          Backport-Reason: <one-line explanation of why the adaptation was needed>
+
+          ### Additional Context
+          ${{ inputs.extra_context }}
+          PROMPT
+
+          agent -p --force --trust --sandbox disabled --output-format stream-json -- "$(cat /tmp/prompt.txt)"
+
+      - name: Push branch
+        run: git push -f origin "${{ steps.pick.outputs.pick_branch }}"
+
+      - name: Create PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base "${{ matrix.pair.branch }}" \
+            --head "${{ steps.pick.outputs.pick_branch }}" \
+            --title "[cherry-pick] ${short} into ${{ matrix.pair.branch }}" \
+            --body "Cherry-pick of \`${{ matrix.pair.sha }}\` from \`${{ inputs.upstream_repo }}\` into \`${{ matrix.pair.branch }}\`. Backport verified by Cursor agent."
+
